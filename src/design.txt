@@ -1,0 +1,204 @@
+======= What is a cache ======
+- A cache is a data structure or a layer between database and application
+- we store the values in cache temporarily to avoid hitting DB repeatedly
+- this reduces load on DB
+- a typical cache can have following methods
+    - get(key)
+    - put(key , value )
+    - remove(key)
+    - contains(key)
+- cache can not store infinite amount of information in it, so it needs to
+    have some policy using which it can evict the keys from cache
+
+========= Requirements =============
+
+- Extensibility
+    - can cache allow new policies to be added - yes
+
+- Dynamic Nature
+    - should cache have configurable size - yes
+    - can cache have any type of data type (should it be generic) - yes
+
+High Traffic
+    - Should cache be thread safe - yes
+
+- Functional
+    Support basic operations
+        - get(key)
+        - put(key, value)
+        -  remove(key) (optional but useful)
+        - contains(key) (optional)
+        - Eviction Policy
+    When cache is full, evict entries according to configured policy.
+        - Initial policy: LRU.
+    Future policies: LFU, FIFO, MRU, etc.
+        - Update Existing Key
+    If key already exists, update value instead of creating duplicate.
+        - Access Tracking
+        - Cache should track usage/access information required by eviction policy.
+
+- Non-Functional
+    - Performance
+        - get(key) - O(1)
+        - put(key, value)  - O(1)
+
+    - Scalability
+        - Cache size should be configurable at runtime/creation time.
+        - Should efficiently handle large numbers of entries.
+
+    - concurrency
+        - Multiple readers and writers may access cache simultaneously.
+        - Data consistency should be maintained.
+
+    Extensibility
+        - New eviction strategies should be pluggable without modifying cache core logic.
+        - Storage implementation should be replaceable if needed.
+
+    Reliability
+        - Cache should never exceed configured capacity.
+        - No duplicate keys.
+        - Data should remain consistent after concurrent operations.
+
+
+- Clarifying Questions
+    - is cache only in-memory ? yes
+    - does cache evection happen automatically on TTL ?? no
+    - Should cache persist after application restart? no
+    - Do we need distributed cache support? no
+    - What happens when capacity = 0? consider as invalid
+
+
+============ Entities and classes ============
+
+CacheEntry -> entity /class
+    - K key field
+    - V value field
+
+Storage
+    - V get(K key)
+    - K remove(K key)
+    - boolean contains(K key)
+    - K put(K key, V value)
+    - size() -> for size of the storage
+
+
+ConcurrentHashMapStorage -> Storage
+    - Map<K, CacheEntry<K,V>> map -> concurrent hash map
+
+EvictionPolicy -> interface
+    - keyUpdated(K key)
+    - keyAdded(K key)
+    - keyAccessed(K key)
+    - keyRemoved(k Key)
+    - K evictKey()  -> returns key which is evicted
+
+
+Logics for LRU
+LRUEvictionPolicy ->EvictionPolicy
+    it maintains the DoublyLinkedList ( for LRU we can use LinkedHashSet, which maintains the insertion order, or generally
+    in interviews we have to write from scratch
+    - keyUpdated(Storage storage, K key)
+        - remove the key from its place
+        - put in front ( no need to evict since the storage size did not change)
+    - keyAdded(Storage storage, K key)
+        - add the value to front of linked list
+    - keyAccessed(Storage storage, K key)
+        - remove the key from its place
+        - put in front ( no need to evict since the storage size did not change)
+    - keyRemoved(Storage storage, k Key)
+        - remove the value from linked list
+    - K evictKey()  -> returns key which is evicted
+        - evict the key from end of the linked list
+
+LRUEvictionPolicy -> EvictionPolicy
+LFUEvictionPolicy -> EvictionPolicy
+FIFOEvictionPolicy -> EvictionPolicy
+
+Cache
+    - int capacity
+    - Storage
+    - EvictionPolicy
+    - V get(K key)
+         Logic:
+            - from storage, call get method
+                - if the get method returns a non-null value, log cache hit and return
+                - if value is not present in the cache, just log cache miss and return null
+                - before returning call EvictionPolicy.keyAccessed(K key)
+    - V remove(K key)
+        Logic
+            - If the storage contains key,
+                - log cache hit
+                - call storage.remove()
+                - call evictionPolicy.remove()
+                return removed value
+            - If it does not contain the key,
+                - log cache miss
+                - dont call anything just return
+                - for return we have two choices
+                    - either throw exception
+                    - return null - lets got with this and let the client handle what happens when cache is missed
+    - boolean contains(K key)
+            - just check in storage if storage contains key and return true/false based on that
+    - K put(K key, V value)
+            - check the storage
+            - if it contains key
+                - call storage put
+                - call eviction policy -> key updated
+                return
+            - if it does not contain key
+                - If the storage Size is full(size == capacity)
+                    - call evictionPolicy -> evictKey() which will return the key
+                    - remove that key from storage
+                - put key in storage
+                - call keyAdded method
+
+- one thing missed, the cache eviction logic will reside in the EvictionPolicy
+    and eviction will not be visible to Storage, so we must pass storage entity to
+    EvictionPolicy
+
+
+
+====== update for concurrency =======
+
+- for maintaining data consistency, we have two methods
+    - synchronize : bad way of doing this because it locks the resource and at a time only one
+                    thread can access the resource
+    - ReentrantReadWriteLock: better way of doing it since it allows multiple threads to read
+                    simultaneously
+
+
+    for eviction policy
+        - every method must have write lock since it updates the metadata of eviction policy
+            - keyAccessed()
+            - keyRemoved()
+            - keyUpdated();
+        lock for this should reside in the eviction policy implementation itself
+            and that lock must be used in all methods
+
+    for storage
+        - get should have the read lock
+        - contains should have read lock
+        - remove should have the write lock since its writing in storage
+        - put should have the write lock
+        for this separate lock should be maintained in the storage class itself (whatever
+        class is implementing this)
+
+    For storage:
+        - there can be multiple implementations of storage
+        - to ensure thread safty we will implement ConcurrentHashMap
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

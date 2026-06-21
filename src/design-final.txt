@@ -1,0 +1,208 @@
+======= What is a Cache =======
+
+A cache is a layer between the application and the database.
+We store values temporarily to avoid hitting the DB repeatedly, reducing DB load.
+
+Basic operations:
+    - get(key)
+    - put(key, value)
+    - remove(key)
+    - contains(key)
+
+Since cache can't store infinite data, it needs an eviction policy.
+
+
+======= Requirements =======
+
+--- Functional ---
+
+    - get(key), put(key, value), remove(key), contains(key)
+    - Eviction when cache is full (default: LRU; extensible to LFU, FIFO, MRU)
+    - Update value if key already exists — no duplicates
+    - Track access/usage info as required by eviction policy
+
+--- Non-Functional ---
+
+    Performance:
+        - get(key)        -> O(1)
+        - put(key, value) -> O(1)
+
+    Scalability:
+        - Configurable capacity at creation time
+        - Efficiently handle large number of entries
+
+    Concurrency:
+        - Multiple readers and writers simultaneously
+        - Data consistency must be maintained
+
+    Extensibility:
+        - New eviction strategies pluggable without modifying cache core
+        - Storage implementation should be swappable
+
+    Reliability:
+        - Cache must never exceed configured capacity
+        - No duplicate keys
+        - Data consistent after concurrent operations
+
+--- Clarifying Questions ---
+
+    - In-memory only? Yes
+    - TTL-based eviction? No
+    - Persist after restart? No
+    - Distributed cache? No
+    - Capacity = 0? Invalid
+
+
+======= Entities and Classes =======
+
+CacheEntry<K, V>
+    - K key
+    - V value
+
+---
+
+Storage<K, V>                          (interface)
+    - V get(K key)
+    - void remove(K key)
+    - boolean contains(K key)
+    - void put(K key, V value)
+    - int size()
+
+ConcurrentHashMapStorage<K, V>         (implements Storage)
+    - Map<K, CacheEntry<K,V>> map      -> ConcurrentHashMap
+
+---
+
+EvictionPolicy<K>                      (interface)
+    - void keyAdded(K key)
+    - void keyAccessed(K key)
+    - void keyUpdated(K key)
+    - void keyRemoved(K key)
+    - K evictKey()                     -> returns key to be evicted
+
+LRUEvictionPolicy<K>                   (implements EvictionPolicy)
+
+    Internally maintains a DoublyLinkedList
+    (can use LinkedHashSet in interviews as shortcut, or implement from scratch)
+
+    - keyAdded(K key)
+        -> add key to front of linked list
+
+    - keyAccessed(K key)
+        -> remove key from current position
+        -> move to front of linked list
+
+    - keyUpdated(K key)
+        -> remove key from current position
+        -> move to front of linked list
+
+    - keyRemoved(K key)
+        -> remove key from linked list
+
+    - evictKey()
+        -> remove and return key from end of linked list (least recently used)
+
+LFUEvictionPolicy<K>                   (implements EvictionPolicy)
+FIFOEvictionPolicy<K>                  (implements EvictionPolicy)
+
+---
+
+Cache<K, V>
+    - int capacity
+    - Storage<K, V> storage
+    - EvictionPolicy<K> evictionPolicy
+    - ReentrantReadWriteLock rwLock    -> (The Global Orchestrator Lock)
+
+    get(K key) -> V
+        // FIRST HALF: High-Concurrency Data Retrieval (Read Lock)
+        rwLock.readLock().lock()
+        V value = null
+        try {
+            value = storage.get(key)
+        } finally {
+            rwLock.readLock().unlock() // Release immediately so other reads aren't blocked
+        }
+
+        // SECOND HALF: Mutate Metadata on Hit (Write Lock)
+        if (value != null) {
+            log cache hit
+            rwLock.writeLock().lock()  // Exclusively lock to update internal eviction structures
+            try {
+                evictionPolicy.keyAccessed(key)
+            } finally {
+                rwLock.writeLock().unlock()
+            }
+            return value
+        } else {
+            log cache miss
+            return null
+        }
+
+    remove(K key) -> void
+        // Entire method requires WRITE lock as it changes data structure sizing and metadata
+        rwLock.writeLock().lock()
+        try {
+            if (storage.contains(key)) {
+                log cache hit
+                storage.remove(key)
+                evictionPolicy.keyRemoved(key)
+            } else {
+                log cache miss
+            }
+        } finally {
+            rwLock.writeLock().unlock()
+        }
+
+    contains(K key) -> boolean
+        // Pure metadata read check (Read Lock)
+        rwLock.readLock().lock()
+        try {
+            return storage.contains(key)
+        } finally {
+            rwLock.readLock().unlock()
+        }
+
+    put(K key, V value) -> void
+        // Entire method requires WRITE lock due to structural adjustments and potential eviction runs
+        rwLock.writeLock().lock()
+        try {
+            if (storage.contains(key)) {
+                storage.put(key, value)
+                evictionPolicy.keyUpdated(key)
+            } else {
+                if (storage.size() == capacity) {
+                    K evictedKey = evictionPolicy.evictKey()
+                    storage.remove(evictedKey)
+                }
+                storage.put(key, value)
+                evictionPolicy.keyAdded(key)
+            }
+        } finally {
+            rwLock.writeLock().unlock()
+        }
+
+
+======= Concurrency & Lock Strategies =======
+
+Approach: Global ReentrantReadWriteLock inside Cache<K, V>
+    - Manually orchestrates synchronization boundaries between Storage and EvictionPolicy.
+
+--- Why split the `get()` method? (Half-Method Lock Strategy) ---
+
+    1. Optimized Throughput:
+       The core data lookup (`storage.get()`) is completely read-safe. If we hold a write lock
+       for the *entire* method, concurrent `get()` requests from thousands of threads would pool up,
+       killing performance. By using a Read Lock for the first half, threads can query data simultaneously.
+
+    2. Explicit Write Lock Elevation:
+       We cannot "upgrade" a Read Lock into a Write Lock inside a single try-finally block in Java
+       (doing so triggers a deadlock). Thus, we must explicitly unlock the Read Lock, and separately
+       acquire a Write Lock for the second half (`evictionPolicy.keyAccessed()`) only when a cache hit occurs.
+
+--- For EvictionPolicy ---
+    - Methods themselves do NOT own locks anymore. They assume they are called within the safe
+      exclusive boundaries of the global Cache `writeLock`.
+
+--- For Storage ---
+    - The underlying ConcurrentHashMap provides low-level thread-safety at the structural level,
+      while the global Cache Read/Write locks maintain atomic states across both the map and the eviction queue.
